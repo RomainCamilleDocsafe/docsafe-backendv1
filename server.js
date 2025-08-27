@@ -10,20 +10,20 @@ import axios from "axios";
 const app = express();
 app.set("trust proxy", 1);
 
-// CORS permissif (beta publique)
+// CORS permissif pour la bêta
 app.use(cors({ origin: true }));
 app.options("*", cors({ origin: true }));
 
 const upload = multer({ dest: "/tmp" });
 
-/* ====== Config ====== */
+/* ===== Config ===== */
 const PORT = process.env.PORT || 8080;
 const ALLOWED = (process.env.ALLOWED_EXT || "pdf,docx,pptx,xlsx,txt")
   .split(",").map(s=>s.trim().toLowerCase());
 const MAX_MB = parseInt(process.env.MAX_FILE_MB || "25", 10);
-const LIMIT_PER_DAY = parseInt(process.env.RATE_LIMIT_PER_DAY || "20", 10); // beta gratuite
+const LIMIT_PER_DAY = parseInt(process.env.RATE_LIMIT_PER_DAY || "20", 10);
 
-/* ====== Rate-limit naïf en mémoire ====== */
+/* ===== Rate limit naïf ===== */
 const usage = new Map();
 function canUse(ip){
   const now = Date.now();
@@ -33,11 +33,11 @@ function canUse(ip){
   u.count++; usage.set(ip, u); return true;
 }
 
-/* ====== Utils ====== */
+/* ===== Utils ===== */
 const extOf = n => (n.split(".").pop() || "").toLowerCase();
 const baseNoExt = n => n.replace(/\.[^.]+$/, "");
 
-/* ====== LanguageTool (grammaire FR/EN auto) ====== */
+/* ===== LanguageTool (FR/EN auto) ===== */
 async function correctWithLanguageTool(text, lang="auto") {
   try {
     if(!text || !text.trim()) return text;
@@ -57,12 +57,11 @@ async function correctWithLanguageTool(text, lang="auto") {
     return corrected;
   } catch (e) {
     console.error("LanguageTool error:", e?.response?.status || e.message);
-    // Fallback : garde le texte tel quel si LT est en rate limit
-    return text;
+    return text; // fallback si quota dépassé
   }
 }
 
-/* ====== PDF : neutraliser métadonnées ====== */
+/* ===== PDF : neutraliser métadonnées ===== */
 async function cleanPDF(inputBuf){
   const pdf = await PDFDocument.load(inputBuf, { updateMetadata: true });
   try { pdf.setTitle(""); } catch {}
@@ -73,7 +72,6 @@ async function cleanPDF(inputBuf){
   try { pdf.setCreator(""); } catch {}
   try { pdf.setCreationDate(new Date(0)); } catch {}
   try { pdf.setModificationDate(new Date()); } catch {}
-
   const out = await pdf.save({ useObjectStreams: false });
   return {
     buffer: Buffer.from(out),
@@ -81,7 +79,7 @@ async function cleanPDF(inputBuf){
   };
 }
 
-/* ====== OOXML générique (PPTX/XLSX) : remove docProps ====== */
+/* ===== OOXML (PPTX/XLSX) : suppression docProps ===== */
 function cleanOOXML_removeDocProps(inputBuf){
   const zip = new AdmZip(inputBuf);
   ["docProps/core.xml","docProps/app.xml","docProps/custom.xml"].forEach(p=>{
@@ -103,7 +101,7 @@ function cleanOOXML_removeDocProps(inputBuf){
   return { buffer: zip.toBuffer(), report: "Office: propriétés supprimées/neutralisées (docProps)." };
 }
 
-/* ====== DOCX : docProps + correction linguistique dans <w:t> ====== */
+/* ===== DOCX : docProps + correction <w:t> ===== */
 async function cleanDOCX_contentAndProps(inputBuf){
   const zip = new AdmZip(inputBuf);
   let changedChars = 0;
@@ -127,7 +125,7 @@ async function cleanDOCX_contentAndProps(inputBuf){
 </cp:coreProperties>`;
   zip.addFile("docProps/core.xml", Buffer.from(coreXml, "utf8"));
 
-  // Fichiers texte Word à traiter
+  // Fichiers Word à traiter
   const targets = ["word/document.xml","word/footnotes.xml","word/endnotes.xml","word/comments.xml"];
   zip.getEntries().forEach(e=>{
     if (e.entryName.startsWith("word/header") && e.entryName.endsWith(".xml")) targets.push(e.entryName);
@@ -138,22 +136,22 @@ async function cleanDOCX_contentAndProps(inputBuf){
     const before = text.length;
     let t = text;
 
-    // Normalisation typographique visible
-    t = t.replace(/\u00A0/g, " ");       // nbsp -> espace
-    t = t.replace(/[ \t]{2,}/g, " ");    // espaces multiples -> 1
-    t = t.replace(/\n{3,}/g, "\n\n");    // sauts de ligne multiples
-    t = t.replace(/ *([:;!?])/g, "$1");  // pas d’espace avant : ; ! ?
-    t = t.replace(/, +/g, ", ");         // espace après virgule
-    t = t.replace(/\.{4,}/g, "...");     // …. -> …
+    // normalisation typographique visible
+    t = t.replace(/\u00A0/g, " ");
+    t = t.replace(/[ \t]{2,}/g, " ");
+    t = t.replace(/\n{3,}/g, "\n\n");
+    t = t.replace(/ *([:;!?])/g, "$1");
+    t = t.replace(/, +/g, ", ");
+    t = t.replace(/\.{4,}/g, "...");
 
-    const t2 = await correctWithLanguageTool(t, "auto"); // FR/EN auto
+    // grammaire FR/EN
+    const t2 = await correctWithLanguageTool(t, "auto");
     if (t2 !== t) ltCorrections++;
     const after = t2.length;
     changedChars += Math.max(0, before - after);
     return t2;
   };
 
-  // Remplacement du contenu de chaque <w:t>
   for (const path of targets) {
     const entry = zip.getEntry(path);
     if (!entry) continue;
@@ -186,7 +184,7 @@ async function cleanDOCX_contentAndProps(inputBuf){
   };
 }
 
-/* ====== TXT : normalisation + LanguageTool ====== */
+/* ===== TXT : normalisation + LT ===== */
 async function cleanTXT_spaces(buf){
   let s = buf.toString("utf8");
   const before = s.length;
@@ -204,13 +202,7 @@ async function cleanTXT_spaces(buf){
   return { buffer: Buffer.from(corrected, "utf8"), report: `TXT: normalisation + corrections LT (Δ${before-after} chars).` };
 }
 
-/* ====== (Hook futur) Humanizer ====== */
-async function humanizeTextIfRequested(text){
-  // TODO: branche ton moteur IA ici si besoin
-  return text;
-}
-
-/* ====== Routes ====== */
+/* ===== Routes ===== */
 app.get("/health", (_req, res) => res.json({ ok: true, message: "Backend is running ✅" }));
 
 app.get("/", (_req, res) => {
@@ -250,17 +242,4 @@ app.post("/api/clean", upload.single("file"), async (req, res) => {
       ({ buffer: outBuf, report } = cleanOOXML_removeDocProps(input));
     }
 
-    const ctype = mimeLookup(ext) || "application/octet-stream";
-    res.setHeader("Content-Type", ctype);
-    res.setHeader("X-DocSafe-Report", report);
-    const base = baseNoExt(req.file.originalname);
-    res.setHeader("Content-Disposition", `attachment; filename="${base}_cleaned.${ext}"`);
-    return res.send(outBuf);
-  } catch (e) {
-    console.error(e);
-    return res.status(500).json({ error: "Server error" });
-  }
-});
-
-/* ====== Start ====== */
-app.listen(PORT, () => console.log(`DocSafe API Beta V1 listening on ${PORT}`));
+    const
