@@ -10,7 +10,7 @@ import axios from "axios";
 const app = express();
 app.set("trust proxy", 1);
 
-// CORS permissif pour la bêta
+// CORS permissif pour la bêta gratuite
 app.use(cors({ origin: true }));
 app.options("*", cors({ origin: true }));
 
@@ -23,7 +23,7 @@ const ALLOWED = (process.env.ALLOWED_EXT || "pdf,docx,pptx,xlsx,txt")
 const MAX_MB = parseInt(process.env.MAX_FILE_MB || "25", 10);
 const LIMIT_PER_DAY = parseInt(process.env.RATE_LIMIT_PER_DAY || "20", 10);
 
-/* ===== Rate limit naïf ===== */
+/* ===== Limiteur naïf (bêta) ===== */
 const usage = new Map();
 function canUse(ip){
   const now = Date.now();
@@ -37,7 +37,7 @@ function canUse(ip){
 const extOf = n => (n.split(".").pop() || "").toLowerCase();
 const baseNoExt = n => n.replace(/\.[^.]+$/, "");
 
-/* ===== LanguageTool (FR/EN auto) ===== */
+/* ===== Correcteur simple + LanguageTool (auto FR/EN) ===== */
 async function correctWithLanguageTool(text, lang="auto") {
   try {
     if(!text || !text.trim()) return text;
@@ -57,11 +57,11 @@ async function correctWithLanguageTool(text, lang="auto") {
     return corrected;
   } catch (e) {
     console.error("LanguageTool error:", e?.response?.status || e.message);
-    return text; // fallback si quota dépassé
+    return text; // fallback si rate limit
   }
 }
 
-/* ===== PDF : neutraliser métadonnées ===== */
+/* ===== PDF : neutralisation métadonnées ===== */
 async function cleanPDF(inputBuf){
   const pdf = await PDFDocument.load(inputBuf, { updateMetadata: true });
   try { pdf.setTitle(""); } catch {}
@@ -125,27 +125,24 @@ async function cleanDOCX_contentAndProps(inputBuf){
 </cp:coreProperties>`;
   zip.addFile("docProps/core.xml", Buffer.from(coreXml, "utf8"));
 
-  // Fichiers Word à traiter
+  // Fichiers texte Word à traiter
   const targets = ["word/document.xml","word/footnotes.xml","word/endnotes.xml","word/comments.xml"];
   zip.getEntries().forEach(e=>{
     if (e.entryName.startsWith("word/header") && e.entryName.endsWith(".xml")) targets.push(e.entryName);
     if (e.entryName.startsWith("word/footer") && e.entryName.endsWith(".xml")) targets.push(e.entryName);
   });
 
+  // Normalisation & grammaire
   const fixTypo = async (text) => {
     const before = text.length;
     let t = text;
-
-    // normalisation typographique visible
-    t = t.replace(/\u00A0/g, " ");
-    t = t.replace(/[ \t]{2,}/g, " ");
-    t = t.replace(/\n{3,}/g, "\n\n");
-    t = t.replace(/ *([:;!?])/g, "$1");
-    t = t.replace(/, +/g, ", ");
-    t = t.replace(/\.{4,}/g, "...");
-
-    // grammaire FR/EN
-    const t2 = await correctWithLanguageTool(t, "auto");
+    t = t.replace(/\u00A0/g, " ");      // nbsp -> espace
+    t = t.replace(/[ \t]{2,}/g, " ");   // espaces multiples
+    t = t.replace(/\n{3,}/g, "\n\n");   // trop de sauts de ligne
+    t = t.replace(/ *([:;!?])/g, "$1");// pas d’espace avant :;!?
+    t = t.replace(/, +/g, ", ");        // espace après virgule
+    t = t.replace(/\.{4,}/g, "...");    // …. -> …
+    const t2 = await correctWithLanguageTool(t, "auto"); // FR/EN
     if (t2 !== t) ltCorrections++;
     const after = t2.length;
     changedChars += Math.max(0, before - after);
@@ -188,17 +185,14 @@ async function cleanDOCX_contentAndProps(inputBuf){
 async function cleanTXT_spaces(buf){
   let s = buf.toString("utf8");
   const before = s.length;
-
   s = s.replace(/\u00A0/g, " ");
   s = s.replace(/[ \t]{2,}/g, " ");
   s = s.replace(/\n{3,}/g, "\n\n");
   s = s.replace(/ *([:;!?])/g, "$1");
   s = s.replace(/, +/g, ", ");
   s = s.replace(/\.{4,}/g, "...");
-
   const corrected = await correctWithLanguageTool(s, "auto");
   const after = corrected.length;
-
   return { buffer: Buffer.from(corrected, "utf8"), report: `TXT: normalisation + corrections LT (Δ${before-after} chars).` };
 }
 
@@ -242,4 +236,18 @@ app.post("/api/clean", upload.single("file"), async (req, res) => {
       ({ buffer: outBuf, report } = cleanOOXML_removeDocProps(input));
     }
 
-    const
+    const ctype = mimeLookup(ext) || "application/octet-stream";
+    res.setHeader("Content-Type", ctype);
+    res.setHeader("X-DocSafe-Report", report);
+    const base = baseNoExt(req.file.originalname);
+    res.setHeader("Content-Disposition", `attachment; filename="${base}_cleaned.${ext}"`);
+    return res.send(outBuf);
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: "Server error" });
+  }
+});
+
+/* ===== Boot ===== */
+app.listen(PORT, () => console.log(`DocSafe API Beta V1 listening on ${PORT}`));
+
