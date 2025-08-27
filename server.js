@@ -5,9 +5,12 @@ import fs from "fs";
 import { PDFDocument } from "pdf-lib";
 import AdmZip from "adm-zip";
 import { lookup as mimeLookup } from "mime-types";
+import axios from "axios";
 
 const app = express();
 app.set("trust proxy", 1);
+
+// CORS permissif (beta publique)
 app.use(cors({ origin: true }));
 app.options("*", cors({ origin: true }));
 
@@ -17,9 +20,9 @@ const PORT = process.env.PORT || 8080;
 const ALLOWED = (process.env.ALLOWED_EXT || "pdf,docx,pptx,xlsx,txt")
   .split(",").map(s=>s.trim().toLowerCase());
 const MAX_MB = parseInt(process.env.MAX_FILE_MB || "25", 10);
-const LIMIT_PER_DAY = parseInt(process.env.RATE_LIMIT_PER_DAY || "50", 10);
+const LIMIT_PER_DAY = parseInt(process.env.RATE_LIMIT_PER_DAY || "20", 10); // beta gratuite
 
-// ——— rate limit naïf (mémoire)
+// ——— rate-limit naïf (mémoire)
 const usage = new Map();
 function canUse(ip){
   const now = Date.now();
@@ -28,21 +31,43 @@ function canUse(ip){
   if(u.count >= LIMIT_PER_DAY) return false;
   u.count++; usage.set(ip, u); return true;
 }
+
 const extOf = n => (n.split(".").pop() || "").toLowerCase();
 const baseNoExt = n => n.replace(/\.[^.]+$/, "");
 
-// ——— cleaners
+// ——— LanguageTool (API publique gratuite, FR/EN auto)
+async function correctWithLanguageTool(text, lang="auto") {
+  try {
+    if(!text || !text.trim()) return text;
+    const res = await axios.post("https://api.languagetool.org/v2/check", null, {
+      params: { text, language: lang }
+    });
+    let corrected = text;
+    let shift = 0;
+    for (const m of res.data.matches || []) {
+      if (!m.replacements || m.replacements.length === 0) continue;
+      const repl = m.replacements[0].value ?? "";
+      const start = m.offset + shift;
+      const end = start + m.length;
+      corrected = corrected.slice(0, start) + repl + corrected.slice(end);
+      shift += repl.length - m.length;
+    }
+    return corrected;
+  } catch (e) {
+    console.error("LanguageTool error:", e?.response?.status || e.message);
+    return text; // fallback si limite dépassée
+  }
+}
+
+// ——— PDF: neutralisation métadonnées (rendu identique)
 async function cleanPDF(inputBuf){
   const pdf = await PDFDocument.load(inputBuf, { updateMetadata: true });
-
-  // Vider métadonnées classiques (sans passer undefined)
   try { pdf.setTitle(""); } catch {}
   try { pdf.setAuthor(""); } catch {}
   try { pdf.setSubject(""); } catch {}
   try { pdf.setKeywords([]); } catch {}
   try { pdf.setProducer(""); } catch {}
   try { pdf.setCreator(""); } catch {}
-  // Dates : on évite undefined → on met une date neutre/présente
   try { pdf.setCreationDate(new Date(0)); } catch {}
   try { pdf.setModificationDate(new Date()); } catch {}
 
@@ -53,14 +78,13 @@ async function cleanPDF(inputBuf){
   };
 }
 
+// ——— OOXML (PPTX/XLSX générique): suppression docProps
 function cleanOOXML_removeDocProps(inputBuf){
   const zip = new AdmZip(inputBuf);
-  // Supprime les props si présentes
   ["docProps/core.xml","docProps/app.xml","docProps/custom.xml"].forEach(p=>{
     const e = zip.getEntry(p);
     if(e) zip.deleteFile(p);
   });
-  // Ajoute un core.xml minimal (révision 1)
   const coreXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties"
  xmlns:dc="http://purl.org/dc/elements/1.1/"
@@ -74,35 +98,128 @@ function cleanOOXML_removeDocProps(inputBuf){
 </cp:coreProperties>`;
   zip.addFile("docProps/core.xml", Buffer.from(coreXml, "utf8"));
 
+  return { buffer: zip.toBuffer(), report: "Office: propriétés supprimées/neutralisées (docProps)." };
+}
+
+// ——— DOCX: métadonnées + correction linguistique (<w:t>)
+async function cleanDOCX_contentAndProps(inputBuf){
+  const zip = new AdmZip(inputBuf);
+  let changedChars = 0;
+  let ltCorrections = 0;
+
+  // 1) métadonnées
+  ["docProps/core.xml","docProps/app.xml","docProps/custom.xml"].forEach(p=>{
+    const e = zip.getEntry(p);
+    if(e) zip.deleteFile(p);
+  });
+  const coreXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties"
+ xmlns:dc="http://purl.org/dc/elements/1.1/"
+ xmlns:dcterms="http://purl.org/dc/terms/"
+ xmlns:dcmitype="http://purl.org/dc/dcmitype/"
+ xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <dc:title></dc:title>
+  <dc:creator></dc:creator>
+  <cp:lastModifiedBy></cp:lastModifiedBy>
+  <cp:revision>1</cp:revision>
+</cp:coreProperties>`;
+  zip.addFile("docProps/core.xml", Buffer.from(coreXml, "utf8"));
+
+  // 2) fichiers texte Word à traiter
+  const targets = ["word/document.xml","word/footnotes.xml","word/endnotes.xml","word/comments.xml"];
+  zip.getEntries().forEach(e=>{
+    if (e.entryName.startsWith("word/header") && e.entryName.endsWith(".xml")) targets.push(e.entryName);
+    if (e.entryName.startsWith("word/footer") && e.entryName.endsWith(".xml")) targets.push(e.entryName);
+  });
+
+  const fixTypo = async (text) => {
+    const before = text.length;
+    let t = text;
+
+    // Normalisation typographique visible
+    t = t.replace(/\u00A0/g, " ");       // nbsp -> espace
+    t = t.replace(/[ \t]{2,}/g, " ");    // espaces multiples -> 1
+    t = t.replace(/\n{3,}/g, "\n\n");    // sauts de ligne multiples
+    t = t.replace(/ *([:;!?])/g, "$1");  // pas d’espace avant : ; ! ?
+    t = t.replace(/, +/g, ", ");         // espace après virgule
+    t = t.replace(/\.{4,}/g, "...");     // …. -> …
+
+    // Correction grammaire/orthographe (FR/EN auto)
+    const t2 = await correctWithLanguageTool(t, "auto");
+    if (t2 !== t) ltCorrections++;
+    const after = t2.length;
+    changedChars += Math.max(0, before - after);
+    return t2;
+  };
+
+  // 3) Remplacer le contenu de chaque <w:t>
+  for (const path of targets) {
+    const entry = zip.getEntry(path);
+    if (!entry) continue;
+    const xml = entry.getData().toString("utf8");
+
+    const fixed = await (async () => {
+      const parts = [];
+      let lastIndex = 0;
+      const regex = /(<w:t\b[^>]*>)([\s\S]*?)(<\/w:t>)/g;
+      let m;
+      while ((m = regex.exec(xml)) !== null) {
+        const [full, open, inner, close] = m;
+        parts.push(xml.slice(lastIndex, m.index));
+        const cleaned = await fixTypo(inner);
+        parts.push(open + cleaned + close);
+        lastIndex = m.index + full.length;
+      }
+      parts.push(xml.slice(lastIndex));
+      return parts.join("");
+    })();
+
+    if (fixed !== xml) {
+      zip.updateFile(path, Buffer.from(fixed, "utf8"));
+    }
+  }
+
   return {
     buffer: zip.toBuffer(),
-    report: "Office: propriétés supprimées/neutralisées (docProps)."
+    report: `DOCX: métadonnées neutralisées + contenu corrigé (espaces/ponctuation/grammaire), corrections LT: ${ltCorrections}, Δ${changedChars} chars.`
   };
 }
 
-function cleanTXT_spaces(buf){
+// ——— TXT: normalisation + LanguageTool
+async function cleanTXT_spaces(buf){
   let s = buf.toString("utf8");
   const before = s.length;
-  s = s.replace(/\u00A0/g, " ");        // nbsp → espace
-  s = s.replace(/[ \t]{2,}/g, " ");     // espaces multiples → 1
-  s = s.replace(/\n{3,}/g, "\n\n");     // >2 sauts → 1
-  s = s.replace(/ *([:;!?])/g, "$1");   // espace avant : ; ! ?
-  s = s.replace(/, +/g, ", ");          // espace après virgule
-  s = s.replace(/\.{4,}/g, "...");      // … nettoyés
-  const after = s.length;
-  return {
-    buffer: Buffer.from(s, "utf8"),
-    report: `TXT: espaces/ponctuation normalisés (Δ${before-after} chars).`
-  };
+
+  s = s.replace(/\u00A0/g, " ");
+  s = s.replace(/[ \t]{2,}/g, " ");
+  s = s.replace(/\n{3,}/g, "\n\n");
+  s = s.replace(/ *([:;!?])/g, "$1");
+  s = s.replace(/, +/g, ", ");
+  s = s.replace(/\.{4,}/g, "...");
+
+  const corrected = await correctWithLanguageTool(s, "auto");
+  const after = corrected.length;
+
+  return { buffer: Buffer.from(corrected, "utf8"), report: `TXT: normalisation + corrections LT (Δ${before-after} chars).` };
 }
 
-// ——— routes
+// ——— (crochet futur) humanizer
+async function humanizeTextIfRequested(text){
+  // TODO: brancher ton moteur IA ici si activé par un flag/query
+  return text;
+}
+
+// ——— Routes
 app.get("/health", (_req, res) => res.json({ ok: true }));
+
+app.get("/", (_req, res) => {
+  res.type("text/plain").send("DocSafe API (beta). Try GET /health or POST /api/clean (multipart/form-data, field 'file').");
+});
 
 app.post("/api/clean", upload.single("file"), async (req, res) => {
   try {
     const ip = req.ip || "unknown";
-    if(!canUse(ip)) return res.status(429).json({ error: "Daily beta limit reached." });
+    if(!canUse(ip)) return res.status(429).json({ error: "Daily beta limit reached (20 docs)." });
 
     if (!req.file) return res.status(400).json({ error: "No file uploaded" });
 
@@ -123,10 +240,14 @@ app.post("/api/clean", upload.single("file"), async (req, res) => {
     let outBuf = input, report = "No change.";
     if(ext === "pdf"){
       ({ buffer: outBuf, report } = await cleanPDF(input));
-    } else if (["docx","pptx","xlsx"].includes(ext)){
+    } else if (ext === "docx"){
+      ({ buffer: outBuf, report } = await cleanDOCX_contentAndProps(input));
+    } else if (["pptx","xlsx"].includes(ext)){
       ({ buffer: outBuf, report } = cleanOOXML_removeDocProps(input));
     } else if (ext === "txt"){
-      ({ buffer: outBuf, report } = cleanTXT_spaces(input));
+      ({ buffer: outBuf, report } = await cleanTXT_spaces(input));
+    } else {
+      ({ buffer: outBuf, report } = cleanOOXML_removeDocProps(input));
     }
 
     const ctype = mimeLookup(ext) || "application/octet-stream";
@@ -141,4 +262,4 @@ app.post("/api/clean", upload.single("file"), async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`DocSafe API V2 listening on ${PORT}`));
+app.listen(PORT, () => console.log(`DocSafe API Beta V1 listening on ${PORT}`));
