@@ -8,6 +8,7 @@
   },
   "dependencies": {
     "adm-zip": "0.5.10",
+    "axios": "^1.6.0",
     "cors": "2.8.5",
     "express": "4.19.2",
     "mime-types": "2.1.35",
