@@ -16,13 +16,14 @@ app.options("*", cors({ origin: true }));
 
 const upload = multer({ dest: "/tmp" });
 
+/* ====== Config ====== */
 const PORT = process.env.PORT || 8080;
 const ALLOWED = (process.env.ALLOWED_EXT || "pdf,docx,pptx,xlsx,txt")
   .split(",").map(s=>s.trim().toLowerCase());
 const MAX_MB = parseInt(process.env.MAX_FILE_MB || "25", 10);
 const LIMIT_PER_DAY = parseInt(process.env.RATE_LIMIT_PER_DAY || "20", 10); // beta gratuite
 
-// ——— rate-limit naïf (mémoire)
+/* ====== Rate-limit naïf en mémoire ====== */
 const usage = new Map();
 function canUse(ip){
   const now = Date.now();
@@ -32,10 +33,11 @@ function canUse(ip){
   u.count++; usage.set(ip, u); return true;
 }
 
+/* ====== Utils ====== */
 const extOf = n => (n.split(".").pop() || "").toLowerCase();
 const baseNoExt = n => n.replace(/\.[^.]+$/, "");
 
-// ——— LanguageTool (API publique gratuite, FR/EN auto)
+/* ====== LanguageTool (grammaire FR/EN auto) ====== */
 async function correctWithLanguageTool(text, lang="auto") {
   try {
     if(!text || !text.trim()) return text;
@@ -55,11 +57,12 @@ async function correctWithLanguageTool(text, lang="auto") {
     return corrected;
   } catch (e) {
     console.error("LanguageTool error:", e?.response?.status || e.message);
-    return text; // fallback si limite dépassée
+    // Fallback : garde le texte tel quel si LT est en rate limit
+    return text;
   }
 }
 
-// ——— PDF: neutralisation métadonnées (rendu identique)
+/* ====== PDF : neutraliser métadonnées ====== */
 async function cleanPDF(inputBuf){
   const pdf = await PDFDocument.load(inputBuf, { updateMetadata: true });
   try { pdf.setTitle(""); } catch {}
@@ -78,7 +81,7 @@ async function cleanPDF(inputBuf){
   };
 }
 
-// ——— OOXML (PPTX/XLSX générique): suppression docProps
+/* ====== OOXML générique (PPTX/XLSX) : remove docProps ====== */
 function cleanOOXML_removeDocProps(inputBuf){
   const zip = new AdmZip(inputBuf);
   ["docProps/core.xml","docProps/app.xml","docProps/custom.xml"].forEach(p=>{
@@ -97,17 +100,16 @@ function cleanOOXML_removeDocProps(inputBuf){
   <cp:revision>1</cp:revision>
 </cp:coreProperties>`;
   zip.addFile("docProps/core.xml", Buffer.from(coreXml, "utf8"));
-
   return { buffer: zip.toBuffer(), report: "Office: propriétés supprimées/neutralisées (docProps)." };
 }
 
-// ——— DOCX: métadonnées + correction linguistique (<w:t>)
+/* ====== DOCX : docProps + correction linguistique dans <w:t> ====== */
 async function cleanDOCX_contentAndProps(inputBuf){
   const zip = new AdmZip(inputBuf);
   let changedChars = 0;
   let ltCorrections = 0;
 
-  // 1) métadonnées
+  // Métadonnées
   ["docProps/core.xml","docProps/app.xml","docProps/custom.xml"].forEach(p=>{
     const e = zip.getEntry(p);
     if(e) zip.deleteFile(p);
@@ -125,7 +127,7 @@ async function cleanDOCX_contentAndProps(inputBuf){
 </cp:coreProperties>`;
   zip.addFile("docProps/core.xml", Buffer.from(coreXml, "utf8"));
 
-  // 2) fichiers texte Word à traiter
+  // Fichiers texte Word à traiter
   const targets = ["word/document.xml","word/footnotes.xml","word/endnotes.xml","word/comments.xml"];
   zip.getEntries().forEach(e=>{
     if (e.entryName.startsWith("word/header") && e.entryName.endsWith(".xml")) targets.push(e.entryName);
@@ -144,15 +146,14 @@ async function cleanDOCX_contentAndProps(inputBuf){
     t = t.replace(/, +/g, ", ");         // espace après virgule
     t = t.replace(/\.{4,}/g, "...");     // …. -> …
 
-    // Correction grammaire/orthographe (FR/EN auto)
-    const t2 = await correctWithLanguageTool(t, "auto");
+    const t2 = await correctWithLanguageTool(t, "auto"); // FR/EN auto
     if (t2 !== t) ltCorrections++;
     const after = t2.length;
     changedChars += Math.max(0, before - after);
     return t2;
   };
 
-  // 3) Remplacer le contenu de chaque <w:t>
+  // Remplacement du contenu de chaque <w:t>
   for (const path of targets) {
     const entry = zip.getEntry(path);
     if (!entry) continue;
@@ -185,7 +186,7 @@ async function cleanDOCX_contentAndProps(inputBuf){
   };
 }
 
-// ——— TXT: normalisation + LanguageTool
+/* ====== TXT : normalisation + LanguageTool ====== */
 async function cleanTXT_spaces(buf){
   let s = buf.toString("utf8");
   const before = s.length;
@@ -203,14 +204,14 @@ async function cleanTXT_spaces(buf){
   return { buffer: Buffer.from(corrected, "utf8"), report: `TXT: normalisation + corrections LT (Δ${before-after} chars).` };
 }
 
-// ——— (crochet futur) humanizer
+/* ====== (Hook futur) Humanizer ====== */
 async function humanizeTextIfRequested(text){
-  // TODO: brancher ton moteur IA ici si activé par un flag/query
+  // TODO: branche ton moteur IA ici si besoin
   return text;
 }
 
-// ——— Routes
-app.get("/health", (_req, res) => res.json({ ok: true }));
+/* ====== Routes ====== */
+app.get("/health", (_req, res) => res.json({ ok: true, message: "Backend is running ✅" }));
 
 app.get("/", (_req, res) => {
   res.type("text/plain").send("DocSafe API (beta). Try GET /health or POST /api/clean (multipart/form-data, field 'file').");
@@ -220,7 +221,6 @@ app.post("/api/clean", upload.single("file"), async (req, res) => {
   try {
     const ip = req.ip || "unknown";
     if(!canUse(ip)) return res.status(429).json({ error: "Daily beta limit reached (20 docs)." });
-
     if (!req.file) return res.status(400).json({ error: "No file uploaded" });
 
     const sizeMB = req.file.size / (1024 * 1024);
@@ -262,4 +262,5 @@ app.post("/api/clean", upload.single("file"), async (req, res) => {
   }
 });
 
+/* ====== Start ====== */
 app.listen(PORT, () => console.log(`DocSafe API Beta V1 listening on ${PORT}`));
