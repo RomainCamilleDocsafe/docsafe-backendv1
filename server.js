@@ -5,86 +5,59 @@ import fs from "fs";
 import { PDFDocument } from "pdf-lib";
 import AdmZip from "adm-zip";
 import { lookup as mimeLookup } from "mime-types";
-import axios from "axios";
 
 const app = express();
 app.set("trust proxy", 1);
-
-// CORS permissif pour la bêta gratuite
 app.use(cors({ origin: true }));
 app.options("*", cors({ origin: true }));
 
 const upload = multer({ dest: "/tmp" });
 
-/* ===== Config ===== */
+/* ========= Config ========= */
 const PORT = process.env.PORT || 8080;
 const ALLOWED = (process.env.ALLOWED_EXT || "pdf,docx,pptx,xlsx,txt")
-  .split(",").map(s=>s.trim().toLowerCase());
+  .split(",").map(s => s.trim().toLowerCase());
 const MAX_MB = parseInt(process.env.MAX_FILE_MB || "25", 10);
 const LIMIT_PER_DAY = parseInt(process.env.RATE_LIMIT_PER_DAY || "20", 10);
 
-/* ===== Limiteur naïf (bêta) ===== */
+/* ========= Limiteur simple (bêta) ========= */
 const usage = new Map();
-function canUse(ip){
+function canUse(ip) {
   const now = Date.now();
   let u = usage.get(ip);
-  if(!u || now > u.reset){ u = { count: 0, reset: now + 24*60*60*1000 }; }
-  if(u.count >= LIMIT_PER_DAY) return false;
+  if (!u || now > u.reset) u = { count: 0, reset: now + 24 * 60 * 60 * 1000 };
+  if (u.count >= LIMIT_PER_DAY) return false;
   u.count++; usage.set(ip, u); return true;
 }
 
-/* ===== Utils ===== */
+/* ========= Helpers ========= */
 const extOf = n => (n.split(".").pop() || "").toLowerCase();
 const baseNoExt = n => n.replace(/\.[^.]+$/, "");
 
-/* ===== Correcteur simple + LanguageTool (auto FR/EN) ===== */
-async function correctWithLanguageTool(text, lang="auto") {
-  try {
-    if(!text || !text.trim()) return text;
-    const res = await axios.post("https://api.languagetool.org/v2/check", null, {
-      params: { text, language: lang }
-    });
-    let corrected = text;
-    let shift = 0;
-    for (const m of res.data.matches || []) {
-      if (!m.replacements || m.replacements.length === 0) continue;
-      const repl = m.replacements[0].value ?? "";
-      const start = m.offset + shift;
-      const end = start + m.length;
-      corrected = corrected.slice(0, start) + repl + corrected.slice(end);
-      shift += repl.length - m.length;
-    }
-    return corrected;
-  } catch (e) {
-    console.error("LanguageTool error:", e?.response?.status || e.message);
-    return text; // fallback si rate limit
-  }
-}
-
-/* ===== PDF : neutralisation métadonnées ===== */
-async function cleanPDF(inputBuf){
+/* ========= PDF : neutraliser métadonnées ========= */
+async function cleanPDF(inputBuf) {
   const pdf = await PDFDocument.load(inputBuf, { updateMetadata: true });
   try { pdf.setTitle(""); } catch {}
   try { pdf.setAuthor(""); } catch {}
   try { pdf.setSubject(""); } catch {}
   try { pdf.setKeywords([]); } catch {}
-  try { pdf.setProducer(""); } catch {}
   try { pdf.setCreator(""); } catch {}
+  try { pdf.setProducer(""); } catch {}
   try { pdf.setCreationDate(new Date(0)); } catch {}
   try { pdf.setModificationDate(new Date()); } catch {}
   const out = await pdf.save({ useObjectStreams: false });
   return {
     buffer: Buffer.from(out),
-    report: "PDF: métadonnées neutralisées (titre/auteur/sujet/mots-clés/créateur/producer/dates)."
+    report: "PDF: métadonnées neutralisées (titre, auteur, sujet, mots-clés, créateur, producteur, dates)."
   };
 }
 
-/* ===== OOXML (PPTX/XLSX) : suppression docProps ===== */
-function cleanOOXML_removeDocProps(inputBuf){
+/* ========= OOXML (PPTX/XLSX) : supprimer docProps ========= */
+function cleanOOXML_removeDocProps(inputBuf) {
   const zip = new AdmZip(inputBuf);
-  ["docProps/core.xml","docProps/app.xml","docProps/custom.xml"].forEach(p=>{
+  ["docProps/core.xml", "docProps/app.xml", "docProps/custom.xml"].forEach(p => {
     const e = zip.getEntry(p);
-    if(e) zip.deleteFile(p);
+    if (e) zip.deleteFile(p);
   });
   const coreXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties"
@@ -98,19 +71,17 @@ function cleanOOXML_removeDocProps(inputBuf){
   <cp:revision>1</cp:revision>
 </cp:coreProperties>`;
   zip.addFile("docProps/core.xml", Buffer.from(coreXml, "utf8"));
-  return { buffer: zip.toBuffer(), report: "Office: propriétés supprimées/neutralisées (docProps)." };
+  return { buffer: zip.toBuffer(), report: "Office: docProps supprimés/neutralisés." };
 }
 
-/* ===== DOCX : docProps + correction <w:t> ===== */
-async function cleanDOCX_contentAndProps(inputBuf){
+/* ========= DOCX : docProps + correction simple du contenu ========= */
+function cleanDOCX_contentAndProps(inputBuf) {
   const zip = new AdmZip(inputBuf);
-  let changedChars = 0;
-  let ltCorrections = 0;
 
-  // Métadonnées
-  ["docProps/core.xml","docProps/app.xml","docProps/custom.xml"].forEach(p=>{
+  // 1) Métadonnées
+  ["docProps/core.xml", "docProps/app.xml", "docProps/custom.xml"].forEach(p => {
     const e = zip.getEntry(p);
-    if(e) zip.deleteFile(p);
+    if (e) zip.deleteFile(p);
   });
   const coreXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties"
@@ -125,50 +96,59 @@ async function cleanDOCX_contentAndProps(inputBuf){
 </cp:coreProperties>`;
   zip.addFile("docProps/core.xml", Buffer.from(coreXml, "utf8"));
 
-  // Fichiers texte Word à traiter
-  const targets = ["word/document.xml","word/footnotes.xml","word/endnotes.xml","word/comments.xml"];
-  zip.getEntries().forEach(e=>{
-    if (e.entryName.startsWith("word/header") && e.entryName.endsWith(".xml")) targets.push(e.entryName);
-    if (e.entryName.startsWith("word/footer") && e.entryName.endsWith(".xml")) targets.push(e.entryName);
+  // 2) Fichiers XML Word à traiter
+  const targets = new Set([
+    "word/document.xml",
+    "word/footnotes.xml",
+    "word/endnotes.xml",
+    "word/comments.xml"
+  ]);
+  zip.getEntries().forEach(e => {
+    if (e.entryName.startsWith("word/header") && e.entryName.endsWith(".xml")) targets.add(e.entryName);
+    if (e.entryName.startsWith("word/footer") && e.entryName.endsWith(".xml")) targets.add(e.entryName);
   });
 
-  // Normalisation & grammaire
-  const fixTypo = async (text) => {
-    const before = text.length;
-    let t = text;
-    t = t.replace(/\u00A0/g, " ");      // nbsp -> espace
-    t = t.replace(/[ \t]{2,}/g, " ");   // espaces multiples
-    t = t.replace(/\n{3,}/g, "\n\n");   // trop de sauts de ligne
-    t = t.replace(/ *([:;!?])/g, "$1");// pas d’espace avant :;!?
-    t = t.replace(/, +/g, ", ");        // espace après virgule
-    t = t.replace(/\.{4,}/g, "...");    // …. -> …
-    const t2 = await correctWithLanguageTool(t, "auto"); // FR/EN
-    if (t2 !== t) ltCorrections++;
-    const after = t2.length;
-    changedChars += Math.max(0, before - after);
-    return t2;
+  let changedBlocks = 0;
+
+  // Normalisation très sûre (pas de grammaire externe)
+  const fixInline = (s) => {
+    const before = s;
+    let t = s;
+
+    // Espaces insécables -> espaces
+    t = t.replace(/\u00A0/g, " ");
+    // Plusieurs espaces -> un
+    t = t.replace(/[ \t]{2,}/g, " ");
+    // Avant ponctuation forte : retirer espace
+    t = t.replace(/ *([:;!?])/g, "$1");
+    // Espace avant point/virgule
+    t = t.replace(/ \./g, ".");
+    t = t.replace(/ ,/g, ",");
+    // Points de suspension normalisés
+    t = t.replace(/\.{4,}/g, "...");
+
+    if (t !== before) changedBlocks++;
+    return t;
   };
 
+  // Remplacer le texte dans <w:t>…</w:t> uniquement
   for (const path of targets) {
     const entry = zip.getEntry(path);
     if (!entry) continue;
     const xml = entry.getData().toString("utf8");
 
-    const fixed = await (async () => {
-      const parts = [];
-      let lastIndex = 0;
-      const regex = /(<w:t\b[^>]*>)([\s\S]*?)(<\/w:t>)/g;
-      let m;
-      while ((m = regex.exec(xml)) !== null) {
-        const [full, open, inner, close] = m;
-        parts.push(xml.slice(lastIndex, m.index));
-        const cleaned = await fixTypo(inner);
-        parts.push(open + cleaned + close);
-        lastIndex = m.index + full.length;
-      }
-      parts.push(xml.slice(lastIndex));
-      return parts.join("");
-    })();
+    const out = [];
+    let last = 0;
+    const re = /(<w:t\b[^>]*>)([\s\S]*?)(<\/w:t>)/g;
+    let m;
+    while ((m = re.exec(xml)) !== null) {
+      const [full, open, inner, close] = m;
+      out.push(xml.slice(last, m.index));
+      out.push(open + fixInline(inner) + close);
+      last = m.index + full.length;
+    }
+    out.push(xml.slice(last));
+    const fixed = out.join("");
 
     if (fixed !== xml) {
       zip.updateFile(path, Buffer.from(fixed, "utf8"));
@@ -177,26 +157,27 @@ async function cleanDOCX_contentAndProps(inputBuf){
 
   return {
     buffer: zip.toBuffer(),
-    report: `DOCX: métadonnées neutralisées + contenu corrigé (espaces/ponctuation/grammaire), corrections LT: ${ltCorrections}, Δ${changedChars} chars.`
+    report: `DOCX: docProps neutralisés + correction simple (espaces/ponctuation) sur contenu. Sections modifiées: ${changedBlocks}.`
   };
 }
 
-/* ===== TXT : normalisation + LT ===== */
-async function cleanTXT_spaces(buf){
+/* ========= TXT : normalisation ========= */
+function cleanTXT_spaces(buf) {
   let s = buf.toString("utf8");
   const before = s.length;
   s = s.replace(/\u00A0/g, " ");
   s = s.replace(/[ \t]{2,}/g, " ");
   s = s.replace(/\n{3,}/g, "\n\n");
   s = s.replace(/ *([:;!?])/g, "$1");
-  s = s.replace(/, +/g, ", ");
+  s = s.replace(/ \./g, ".");
+  s = s.replace(/ ,/g, ",");
   s = s.replace(/\.{4,}/g, "...");
-  const corrected = await correctWithLanguageTool(s, "auto");
-  const after = corrected.length;
-  return { buffer: Buffer.from(corrected, "utf8"), report: `TXT: normalisation + corrections LT (Δ${before-after} chars).` };
+
+  const after = s.length;
+  return { buffer: Buffer.from(s, "utf8"), report: `TXT: normalisation (Δ${before - after} chars).` };
 }
 
-/* ===== Routes ===== */
+/* ========= Routes ========= */
 app.get("/health", (_req, res) => res.json({ ok: true, message: "Backend is running ✅" }));
 
 app.get("/", (_req, res) => {
@@ -206,32 +187,33 @@ app.get("/", (_req, res) => {
 app.post("/api/clean", upload.single("file"), async (req, res) => {
   try {
     const ip = req.ip || "unknown";
-    if(!canUse(ip)) return res.status(429).json({ error: "Daily beta limit reached (20 docs)." });
+    if (!canUse(ip)) return res.status(429).json({ error: "Daily beta limit reached (20 docs)." });
     if (!req.file) return res.status(400).json({ error: "No file uploaded" });
 
     const sizeMB = req.file.size / (1024 * 1024);
     const ext = extOf(req.file.originalname);
-    if (!ALLOWED.includes(ext)){
-      try{ fs.unlinkSync(req.file.path); }catch{}
+
+    if (!ALLOWED.includes(ext)) {
+      try { fs.unlinkSync(req.file.path); } catch {}
       return res.status(400).json({ error: "Unsupported file type" });
     }
-    if (sizeMB > MAX_MB){
-      try{ fs.unlinkSync(req.file.path); }catch{}
+    if (sizeMB > MAX_MB) {
+      try { fs.unlinkSync(req.file.path); } catch {}
       return res.status(400).json({ error: "File too large" });
     }
 
     const input = fs.readFileSync(req.file.path);
-    try{ fs.unlinkSync(req.file.path); }catch{}
+    try { fs.unlinkSync(req.file.path); } catch {}
 
-    let outBuf = input, report = "No change.";
-    if(ext === "pdf"){
+    let outBuf = input, report = "No change";
+    if (ext === "pdf") {
       ({ buffer: outBuf, report } = await cleanPDF(input));
-    } else if (ext === "docx"){
-      ({ buffer: outBuf, report } = await cleanDOCX_contentAndProps(input));
-    } else if (["pptx","xlsx"].includes(ext)){
+    } else if (ext === "docx") {
+      ({ buffer: outBuf, report } = cleanDOCX_contentAndProps(input));
+    } else if (["pptx", "xlsx"].includes(ext)) {
       ({ buffer: outBuf, report } = cleanOOXML_removeDocProps(input));
-    } else if (ext === "txt"){
-      ({ buffer: outBuf, report } = await cleanTXT_spaces(input));
+    } else if (ext === "txt") {
+      ({ buffer: outBuf, report } = cleanTXT_spaces(input));
     } else {
       ({ buffer: outBuf, report } = cleanOOXML_removeDocProps(input));
     }
@@ -241,13 +223,12 @@ app.post("/api/clean", upload.single("file"), async (req, res) => {
     res.setHeader("X-DocSafe-Report", report);
     const base = baseNoExt(req.file.originalname);
     res.setHeader("Content-Disposition", `attachment; filename="${base}_cleaned.${ext}"`);
-    return res.send(outBuf);
+    res.send(outBuf);
   } catch (e) {
     console.error(e);
-    return res.status(500).json({ error: "Server error" });
+    res.status(500).json({ error: "Server error" });
   }
 });
 
-/* ===== Boot ===== */
+/* ========= Boot ========= */
 app.listen(PORT, () => console.log(`DocSafe API Beta V1 listening on ${PORT}`));
-
